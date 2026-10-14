@@ -7,7 +7,7 @@ from nba_api.stats.endpoints import leaguegamefinder
 
 
 START_DATE = date(2015, 1, 1)
-OUTPUT_PATH = Path("/data/nba_season.csv")
+OUTPUT_PATH = Path(r"")
 SEASON_TYPES = {
     "Regular Season": "regular",
     "Playoffs": "playoffs",
