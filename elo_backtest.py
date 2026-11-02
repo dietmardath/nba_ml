@@ -34,12 +34,13 @@ def margin_multiplier(margin: int, rating_difference: float) -> float:
     return math.log(abs(margin) + 1) * 2.2 / (2.2 + 0.001 * abs(rating_difference))
 
 
-def run_backtest(
+def simulate(
     games: pd.DataFrame,
     home_advantage: float = DEFAULT_HOME_ADVANTAGE,
     k_factor: float = DEFAULT_K_FACTOR,
     season_regression: float = SEASON_REGRESSION,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Run the Elo simulation and return per-game predictions plus final ratings."""
     missing = REQUIRED_COLUMNS - set(games.columns)
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
@@ -105,7 +106,21 @@ def run_backtest(
         for team, change in rating_changes.items():
             ratings[team] = ratings.get(team, INITIAL_RATING) + change
 
-    prediction_frame = pd.DataFrame(predictions)
+    return pd.DataFrame(predictions), ratings
+
+
+def run_backtest(
+    games: pd.DataFrame,
+    home_advantage: float = DEFAULT_HOME_ADVANTAGE,
+    k_factor: float = DEFAULT_K_FACTOR,
+    season_regression: float = SEASON_REGRESSION,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    prediction_frame, _ = simulate(
+        games,
+        home_advantage=home_advantage,
+        k_factor=k_factor,
+        season_regression=season_regression,
+    )
     if prediction_frame.empty:
         return prediction_frame, pd.DataFrame(
             columns=["season", "games", "home_accuracy", "brier_score", "log_loss"]
