@@ -25,6 +25,8 @@ RECENT_GAMES = 10
 FEATURE_COLUMNS = [
     "home_rating_pre",
     "away_rating_pre",
+    "home_home_advantage",
+    "away_home_advantage",
     "home_win_probability",
     "home_recent_win_rate",
     "away_recent_win_rate",

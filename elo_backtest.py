@@ -13,6 +13,54 @@ DEFAULT_HOME_ADVANTAGE = 80.0
 DEFAULT_K_FACTOR = 20.0
 SEASON_REGRESSION = 1 / 3
 REQUIRED_COLUMNS = {"date", "home_team", "away_team", "homescore", "awayscore"}
+ELO_POINTS_PER_MARGIN = 30.0
+HOME_ADVANTAGE_PRIOR_GAMES = 40.0
+
+
+class HomeAdvantageTracker:
+    """Leakage-safe per-team home advantage estimated from past games only.
+
+    Tracks each team's home/away point-differential split and shrinks its
+    deviation from the league split toward zero, then converts it to Elo
+    points on top of the league-wide base advantage.
+    """
+
+    def __init__(self, base_advantage: float = DEFAULT_HOME_ADVANTAGE) -> None:
+        self.base_advantage = base_advantage
+        self.home_margin: dict[str, float] = {}
+        self.away_margin: dict[str, float] = {}
+        self.home_games: dict[str, int] = {}
+        self.away_games: dict[str, int] = {}
+        self.league_home_margin = 0.0
+        self.league_away_margin = 0.0
+        self.league_home_games = 0
+        self.league_away_games = 0
+
+    def advantage(self, team: str) -> float:
+        home_games = self.home_games.get(team, 0)
+        away_games = self.away_games.get(team, 0)
+        if not home_games or not away_games or not self.league_home_games or not self.league_away_games:
+            return self.base_advantage
+        team_split = (
+            self.home_margin[team] / home_games - self.away_margin[team] / away_games
+        )
+        league_split = (
+            self.league_home_margin / self.league_home_games
+            - self.league_away_margin / self.league_away_games
+        )
+        games = home_games + away_games
+        shrinkage = games / (games + HOME_ADVANTAGE_PRIOR_GAMES)
+        return self.base_advantage + (team_split - league_split) * shrinkage * ELO_POINTS_PER_MARGIN
+
+    def update(self, home_team: str, away_team: str, margin: float) -> None:
+        self.home_margin[home_team] = self.home_margin.get(home_team, 0.0) + margin
+        self.home_games[home_team] = self.home_games.get(home_team, 0) + 1
+        self.away_margin[away_team] = self.away_margin.get(away_team, 0.0) - margin
+        self.away_games[away_team] = self.away_games.get(away_team, 0) + 1
+        self.league_home_margin += margin
+        self.league_away_margin -= margin
+        self.league_home_games += 1
+        self.league_away_games += 1
 
 
 def season_start(date: pd.Timestamp) -> int:
@@ -39,8 +87,8 @@ def simulate(
     home_advantage: float = DEFAULT_HOME_ADVANTAGE,
     k_factor: float = DEFAULT_K_FACTOR,
     season_regression: float = SEASON_REGRESSION,
-) -> tuple[pd.DataFrame, dict[str, float]]:
-    """Run the Elo simulation and return per-game predictions plus final ratings."""
+) -> tuple[pd.DataFrame, dict[str, float], HomeAdvantageTracker]:
+    """Run the Elo simulation and return predictions, final ratings, and advantages."""
     missing = REQUIRED_COLUMNS - set(games.columns)
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
@@ -57,6 +105,7 @@ def simulate(
     games = games.sort_values(["date", "home_team", "away_team"], kind="stable")
 
     ratings: dict[str, float] = {}
+    advantages = HomeAdvantageTracker(base_advantage=home_advantage)
     previous_season: int | None = None
     predictions: list[dict[str, object]] = []
 
@@ -71,8 +120,11 @@ def simulate(
         for game in day_games.itertuples(index=False):
             home_rating = ratings.get(game.home_team, INITIAL_RATING)
             away_rating = ratings.get(game.away_team, INITIAL_RATING)
-            adjusted_difference = home_rating + home_advantage - away_rating
-            probability = home_win_probability(home_rating, away_rating, home_advantage)
+            game_advantage = advantages.advantage(game.home_team)
+            adjusted_difference = home_rating + game_advantage - away_rating
+            probability = home_win_probability(
+                home_rating, away_rating, game_advantage
+            )
             actual = float(game.homescore > game.awayscore)
             prediction = {
                 "date": game_date,
@@ -83,6 +135,8 @@ def simulate(
                 "away_score": game.awayscore,
                 "home_rating_pre": home_rating,
                 "away_rating_pre": away_rating,
+                "home_home_advantage": game_advantage,
+                "away_home_advantage": advantages.advantage(game.away_team),
                 "home_win_probability": probability,
                 "actual_home_win": actual,
                 "predicted_home_win": probability >= 0.5,
@@ -101,12 +155,13 @@ def simulate(
             away_team = prediction["away_team"]
             rating_changes[home_team] = rating_changes.get(home_team, 0.0) + change
             rating_changes[away_team] = rating_changes.get(away_team, 0.0) - change
+            advantages.update(home_team, away_team, float(margin))
             predictions.append(prediction)
 
         for team, change in rating_changes.items():
             ratings[team] = ratings.get(team, INITIAL_RATING) + change
 
-    return pd.DataFrame(predictions), ratings
+    return pd.DataFrame(predictions), ratings, advantages
 
 
 def run_backtest(
@@ -115,7 +170,7 @@ def run_backtest(
     k_factor: float = DEFAULT_K_FACTOR,
     season_regression: float = SEASON_REGRESSION,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    prediction_frame, _ = simulate(
+    prediction_frame, _, _ = simulate(
         games,
         home_advantage=home_advantage,
         k_factor=k_factor,

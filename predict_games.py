@@ -10,7 +10,7 @@ import pandas as pd
 from nba_api.stats.endpoints import scoreboardv3
 
 from elo_backtest import (
-    DEFAULT_HOME_ADVANTAGE,
+    HomeAdvantageTracker,
     INITIAL_RATING,
     home_win_probability,
     simulate,
@@ -96,7 +96,10 @@ def fetch_schedule(game_date: date) -> pd.DataFrame:
 
 
 def build_features(
-    schedule: pd.DataFrame, ratings: dict[str, float], form: pd.DataFrame
+    schedule: pd.DataFrame,
+    ratings: dict[str, float],
+    form: pd.DataFrame,
+    advantages: HomeAdvantageTracker,
 ) -> pd.DataFrame:
     rows = []
     for game in schedule.itertuples(index=False):
@@ -105,6 +108,7 @@ def build_features(
         away_rating = ratings.get(away, INITIAL_RATING)
         home_form = form.loc[home] if home in form.index else None
         away_form = form.loc[away] if away in form.index else None
+        home_advantage = advantages.advantage(home)
         rows.append(
             {
                 "home_team": home,
@@ -112,8 +116,10 @@ def build_features(
                 "status": game.status,
                 "home_rating_pre": home_rating,
                 "away_rating_pre": away_rating,
+                "home_home_advantage": home_advantage,
+                "away_home_advantage": advantages.advantage(away),
                 "home_win_probability": home_win_probability(
-                    home_rating, away_rating, DEFAULT_HOME_ADVANTAGE
+                    home_rating, away_rating, home_advantage
                 ),
                 "home_recent_win_rate": (
                     home_form["win_rate"] if home_form is not None else 0.5
@@ -163,7 +169,7 @@ def main() -> None:
     else:
         games = update_dataset()
 
-    predictions, ratings = simulate(games)
+    predictions, ratings, advantages = simulate(games)
     form = build_team_form(predictions)
 
     schedule = fetch_schedule(game_date)
@@ -171,7 +177,7 @@ def main() -> None:
         print(f"Keine NBA-Spiele am {game_date:%d.%m.%Y}.")
         return
 
-    matchups = build_features(schedule, ratings, form)
+    matchups = build_features(schedule, ratings, form, advantages)
 
     model_probabilities = None
     try:
