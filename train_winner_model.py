@@ -11,7 +11,7 @@ from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from elo_backtest import run_backtest
+from elo_backtest import RECENT_GAMES, run_backtest
 
 
 ROOT = Path(__file__).resolve().parent
@@ -21,7 +21,6 @@ DEFAULT_PREDICTIONS_OUTPUT = ROOT / "data" / "ml_winner_predictions.csv"
 DEFAULT_METRICS_OUTPUT = ROOT / "data" / "ml_winner_validation.csv"
 TRAIN_SEASONS = range(2015, 2022)
 VALIDATION_SEASONS = (2022, 2023)
-RECENT_GAMES = 10
 FEATURE_COLUMNS = [
     "home_rating_pre",
     "away_rating_pre",

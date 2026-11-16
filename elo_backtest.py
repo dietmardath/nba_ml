@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import math
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
+import joblib
 import pandas as pd
 
 
@@ -15,6 +18,19 @@ SEASON_REGRESSION = 1 / 3
 REQUIRED_COLUMNS = {"date", "home_team", "away_team", "homescore", "awayscore"}
 ELO_POINTS_PER_MARGIN = 30.0
 HOME_ADVANTAGE_PRIOR_GAMES = 40.0
+RECENT_GAMES = 10
+DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "models" / "elo_state.joblib"
+
+
+@dataclass
+class EloState:
+    """Reusable state of an Elo simulation, safe to serialize with joblib."""
+
+    ratings: dict[str, float] = field(default_factory=dict)
+    recent_form: dict[str, deque] = field(default_factory=dict)
+    advantages: HomeAdvantageTracker = field(default_factory=lambda: HomeAdvantageTracker())
+    previous_season: int | None = None
+    last_date: pd.Timestamp | None = None
 
 
 class HomeAdvantageTracker:
@@ -82,13 +98,13 @@ def margin_multiplier(margin: int, rating_difference: float) -> float:
     return math.log(abs(margin) + 1) * 2.2 / (2.2 + 0.001 * abs(rating_difference))
 
 
-def simulate(
+def replay_games(
+    state: EloState,
     games: pd.DataFrame,
-    home_advantage: float = DEFAULT_HOME_ADVANTAGE,
     k_factor: float = DEFAULT_K_FACTOR,
     season_regression: float = SEASON_REGRESSION,
-) -> tuple[pd.DataFrame, dict[str, float], HomeAdvantageTracker]:
-    """Run the Elo simulation and return predictions, final ratings, and advantages."""
+) -> pd.DataFrame:
+    """Replay games day-by-day through the Elo update logic, mutating the state."""
     missing = REQUIRED_COLUMNS - set(games.columns)
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
@@ -104,17 +120,17 @@ def simulate(
     games["season"] = games["date"].map(lambda date: season_label(season_start(date)))
     games = games.sort_values(["date", "home_team", "away_team"], kind="stable")
 
-    ratings: dict[str, float] = {}
-    advantages = HomeAdvantageTracker(base_advantage=home_advantage)
-    previous_season: int | None = None
+    ratings = state.ratings
+    recent_form = state.recent_form
+    advantages = state.advantages
     predictions: list[dict[str, object]] = []
 
     for game_date, day_games in games.groupby("date", sort=True):
         current_season = season_start(game_date)
-        if previous_season is not None and current_season != previous_season:
+        if state.previous_season is not None and current_season != state.previous_season:
             for team in ratings:
                 ratings[team] += (INITIAL_RATING - ratings[team]) * season_regression
-        previous_season = current_season
+        state.previous_season = current_season
 
         daily_predictions = []
         for game in day_games.itertuples(index=False):
@@ -156,12 +172,74 @@ def simulate(
             rating_changes[home_team] = rating_changes.get(home_team, 0.0) + change
             rating_changes[away_team] = rating_changes.get(away_team, 0.0) - change
             advantages.update(home_team, away_team, float(margin))
+            home_win = int(prediction["actual_home_win"])
+            recent_form.setdefault(home_team, deque(maxlen=RECENT_GAMES)).append(
+                (home_win, int(margin))
+            )
+            recent_form.setdefault(away_team, deque(maxlen=RECENT_GAMES)).append(
+                (1 - home_win, -int(margin))
+            )
             predictions.append(prediction)
 
         for team, change in rating_changes.items():
             ratings[team] = ratings.get(team, INITIAL_RATING) + change
 
-    return pd.DataFrame(predictions), ratings, advantages
+        state.last_date = game_date
+
+    return pd.DataFrame(predictions)
+
+
+def simulate(
+    games: pd.DataFrame,
+    home_advantage: float = DEFAULT_HOME_ADVANTAGE,
+    k_factor: float = DEFAULT_K_FACTOR,
+    season_regression: float = SEASON_REGRESSION,
+) -> tuple[pd.DataFrame, EloState]:
+    """Run the Elo simulation from scratch and return predictions plus final state."""
+    state = EloState(advantages=HomeAdvantageTracker(base_advantage=home_advantage))
+    predictions = replay_games(
+        state, games, k_factor=k_factor, season_regression=season_regression
+    )
+    return predictions, state
+
+
+def save_elo_state(state: EloState, path: Path = DEFAULT_STATE_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(state, path)
+
+
+def load_elo_state(path: Path = DEFAULT_STATE_PATH) -> EloState | None:
+    if not path.exists():
+        return None
+    try:
+        state = joblib.load(path)
+    except Exception:
+        return None
+    return state if isinstance(state, EloState) else None
+
+
+def update_elo_state(
+    games: pd.DataFrame,
+    path: Path = DEFAULT_STATE_PATH,
+    home_advantage: float = DEFAULT_HOME_ADVANTAGE,
+    k_factor: float = DEFAULT_K_FACTOR,
+    season_regression: float = SEASON_REGRESSION,
+) -> EloState:
+    """Load the cached state, replay only games after its last date, and save it."""
+    state = load_elo_state(path)
+    if state is None:
+        state = EloState(
+            advantages=HomeAdvantageTracker(base_advantage=home_advantage)
+        )
+    dates = pd.to_datetime(games["date"], errors="raise")
+    if state.last_date is not None:
+        games = games[dates > state.last_date]
+    if not games.empty:
+        replay_games(
+            state, games, k_factor=k_factor, season_regression=season_regression
+        )
+    save_elo_state(state, path)
+    return state
 
 
 def run_backtest(
@@ -170,7 +248,7 @@ def run_backtest(
     k_factor: float = DEFAULT_K_FACTOR,
     season_regression: float = SEASON_REGRESSION,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    prediction_frame, _, _ = simulate(
+    prediction_frame, _ = simulate(
         games,
         home_advantage=home_advantage,
         k_factor=k_factor,

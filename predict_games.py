@@ -10,17 +10,18 @@ import pandas as pd
 from nba_api.stats.endpoints import scoreboardv3
 
 from elo_backtest import (
-    HomeAdvantageTracker,
+    EloState,
     INITIAL_RATING,
     home_win_probability,
-    simulate,
+    update_elo_state,
 )
 from fetch_nba_games import OUTPUT_PATH, update_dataset
-from train_winner_model import FEATURE_COLUMNS, RECENT_GAMES
+from train_winner_model import FEATURE_COLUMNS
 
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL = ROOT / "models" / "nba_winner_model.joblib"
+DEFAULT_STATE = ROOT / "models" / "elo_state.joblib"
 
 
 def default_game_date() -> date:
@@ -33,28 +34,17 @@ def default_game_date() -> date:
     return nba_today + timedelta(days=1)
 
 
-def build_team_form(predictions: pd.DataFrame) -> pd.DataFrame:
-    home_games = pd.DataFrame(
-        {
-            "date": predictions["date"],
-            "team": predictions["home_team"],
-            "win": predictions["actual_home_win"].astype(float),
-            "margin": predictions["home_score"] - predictions["away_score"],
+def build_team_form(state: EloState) -> pd.DataFrame:
+    rows = {
+        team: {
+            "win_rate": sum(win for win, _ in history) / len(history),
+            "margin": sum(margin for _, margin in history) / len(history),
+            "games": len(history),
         }
-    )
-    away_games = pd.DataFrame(
-        {
-            "date": predictions["date"],
-            "team": predictions["away_team"],
-            "win": 1 - predictions["actual_home_win"].astype(float),
-            "margin": predictions["away_score"] - predictions["home_score"],
-        }
-    )
-    long = pd.concat([home_games, away_games]).sort_values("date", kind="stable")
-    recent = long.groupby("team").tail(RECENT_GAMES)
-    return recent.groupby("team").agg(
-        win_rate=("win", "mean"), margin=("margin", "mean"), games=("win", "size")
-    )
+        for team, history in state.recent_form.items()
+        if history
+    }
+    return pd.DataFrame.from_dict(rows, orient="index")
 
 
 def fetch_schedule(game_date: date) -> pd.DataFrame:
@@ -97,18 +87,17 @@ def fetch_schedule(game_date: date) -> pd.DataFrame:
 
 def build_features(
     schedule: pd.DataFrame,
-    ratings: dict[str, float],
+    state: EloState,
     form: pd.DataFrame,
-    advantages: HomeAdvantageTracker,
 ) -> pd.DataFrame:
     rows = []
     for game in schedule.itertuples(index=False):
         home, away = game.home_team, game.away_team
-        home_rating = ratings.get(home, INITIAL_RATING)
-        away_rating = ratings.get(away, INITIAL_RATING)
+        home_rating = state.ratings.get(home, INITIAL_RATING)
+        away_rating = state.ratings.get(away, INITIAL_RATING)
         home_form = form.loc[home] if home in form.index else None
         away_form = form.loc[away] if away in form.index else None
-        home_advantage = advantages.advantage(home)
+        home_advantage = state.advantages.advantage(home)
         rows.append(
             {
                 "home_team": home,
@@ -117,7 +106,7 @@ def build_features(
                 "home_rating_pre": home_rating,
                 "away_rating_pre": away_rating,
                 "home_home_advantage": home_advantage,
-                "away_home_advantage": advantages.advantage(away),
+                "away_home_advantage": state.advantages.advantage(away),
                 "home_win_probability": home_win_probability(
                     home_rating, away_rating, home_advantage
                 ),
@@ -160,6 +149,7 @@ def main() -> None:
         help="Skip refreshing the game history from the NBA API.",
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     args = parser.parse_args()
 
     game_date = args.date or default_game_date()
@@ -169,15 +159,15 @@ def main() -> None:
     else:
         games = update_dataset()
 
-    predictions, ratings, advantages = simulate(games)
-    form = build_team_form(predictions)
+    state = update_elo_state(games, path=args.state)
+    form = build_team_form(state)
 
     schedule = fetch_schedule(game_date)
     if schedule.empty:
         print(f"Keine NBA-Spiele am {game_date:%d.%m.%Y}.")
         return
 
-    matchups = build_features(schedule, ratings, form, advantages)
+    matchups = build_features(schedule, state, form)
 
     model_probabilities = None
     try:
